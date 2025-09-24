@@ -1,0 +1,179 @@
+// app.js
+// Full demo: Ticket booking with seat locking + simulation
+
+const express = require("express");
+const bodyParser = require("body-parser");
+
+// ---------- EXPRESS SERVER ----------
+const app = express();
+app.use(bodyParser.json());
+
+const seats = new Map();
+const DEFAULT_LOCK_TTL = 60 * 1000; // 1 minute
+
+function createSeats() {
+  ["A", "B", "C"].forEach((row) => {
+    for (let i = 1; i <= 5; i++) {
+      const id = ${row}${i};
+      seats.set(id, {
+        id,
+        status: "available", // "available" | "locked" | "booked"
+        lockedBy: null,
+        lockExpiresAt: null,
+        lockTimer: null,
+        bookedBy: null,
+      });
+    }
+  });
+}
+createSeats();
+
+function clearSeatLockTimer(seat) {
+  if (seat.lockTimer) {
+    clearTimeout(seat.lockTimer);
+    seat.lockTimer = null;
+  }
+}
+function expireLock(seatId) {
+  const seat = seats.get(seatId);
+  if (seat && seat.status === "locked") {
+    console.log(Lock expired for ${seatId} (held by ${seat.lockedBy}));
+    seat.status = "available";
+    seat.lockedBy = null;
+    seat.lockExpiresAt = null;
+    seat.lockTimer = null;
+  }
+}
+
+// List seats
+app.get("/seats", (req, res) => {
+  const list = Array.from(seats.values()).map((s) => ({
+    id: s.id,
+    status: s.status,
+    lockedBy: s.lockedBy,
+    lockExpiresAt: s.lockExpiresAt,
+    bookedBy: s.bookedBy,
+  }));
+  res.json({ success: true, seats: list });
+});
+
+// Lock a seat
+app.post("/lock", (req, res) => {
+  const { seatId, userId, ttlMs } = req.body;
+  if (!seatId || !userId) return res.status(400).json({ success: false, message: "seatId and userId required" });
+  const seat = seats.get(seatId);
+  if (!seat) return res.status(404).json({ success: false, message: "Seat not found" });
+
+  if (seat.status === "booked") return res.status(409).json({ success: false, message: "Seat already booked" });
+
+  if (seat.status === "locked") {
+    if (seat.lockedBy === userId) {
+      clearSeatLockTimer(seat);
+      const ttl = typeof ttlMs === "number" ? ttlMs : DEFAULT_LOCK_TTL;
+      seat.lockExpiresAt = Date.now() + ttl;
+      seat.lockTimer = setTimeout(() => expireLock(seatId), ttl);
+      return res.json({ success: true, message: "Lock renewed", seatId, lockedBy: userId, expiresAt: seat.lockExpiresAt });
+    }
+    return res.status(409).json({ success: false, message: Seat locked by another user (${seat.lockedBy}) });
+  }
+
+  const ttl = typeof ttlMs === "number" ? ttlMs : DEFAULT_LOCK_TTL;
+  seat.status = "locked";
+  seat.lockedBy = userId;
+  seat.lockExpiresAt = Date.now() + ttl;
+  seat.lockTimer = setTimeout(() => expireLock(seatId), ttl);
+
+  res.json({ success: true, message: Seat ${seatId} locked for user ${userId}, seatId, lockedBy: userId, lockExpiresAt: seat.lockExpiresAt });
+});
+
+// Confirm booking
+app.post("/confirm", (req, res) => {
+  const { seatId, userId } = req.body;
+  const seat = seats.get(seatId);
+  if (!seat) return res.status(404).json({ success: false, message: "Seat not found" });
+  if (seat.status === "booked") return res.status(409).json({ success: false, message: "Seat already booked" });
+  if (seat.status !== "locked") return res.status(409).json({ success: false, message: "Seat not locked" });
+  if (seat.lockedBy !== userId) return res.status(403).json({ success: false, message: "You do not hold this lock" });
+
+  clearSeatLockTimer(seat);
+  seat.status = "booked";
+  seat.bookedBy = userId;
+  seat.lockedBy = null;
+  seat.lockExpiresAt = null;
+  res.json({ success: true, message: Seat ${seatId} booked by ${userId} });
+});
+
+// Unlock
+app.post("/unlock", (req, res) => {
+  const { seatId, userId } = req.body;
+  const seat = seats.get(seatId);
+  if (!seat) return res.status(404).json({ success: false, message: "Seat not found" });
+  if (seat.status !== "locked") return res.status(409).json({ success: false, message: "Seat not locked" });
+  if (seat.lockedBy !== userId) return res.status(403).json({ success: false, message: "Not your lock" });
+
+  clearSeatLockTimer(seat);
+  seat.status = "available";
+  seat.lockedBy = null;
+  seat.lockExpiresAt = null;
+  res.json({ success: true, message: Lock released for ${seatId} });
+});
+
+// Reset seats (for tests)
+app.post("/reset", (req, res) => {
+  for (const s of seats.values()) clearSeatLockTimer(s);
+  seats.clear();
+  createSeats();
+  res.json({ success: true, message: "Seats reset" });
+});
+
+// Start server
+const PORT = 3000;
+app.listen(PORT, () => console.log(Server running on http://localhost:${PORT}));
+
+// ---------- SIMULATION TEST ----------
+async function runSimulation() {
+  const fetch = global.fetch || (await import("node-fetch")).default;
+  const SERVER = http://localhost:${PORT};
+  const seatId = "A1";
+  const users = ["alice", "bob", "carol", "dave"];
+
+  console.log("\n--- Running simulation ---");
+  await fetch(${SERVER}/reset, { method: "POST" });
+
+  // Concurrent lock attempts
+  const lockResults = await Promise.all(
+    users.map((u) =>
+      fetch(${SERVER}/lock, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seatId, userId: u }),
+      }).then(async (r) => ({ user: u, status: r.status, body: await r.json() }))
+    )
+  );
+
+  console.log("\nLock results:");
+  lockResults.forEach((r) => console.log(${r.user}:, r.body));
+
+  const winner = lockResults.find((r) => r.status === 200 && r.body.success);
+  if (!winner) return console.log("No winner (unexpected).");
+
+  console.log(\nWinner: ${winner.user}. Now confirming...);
+
+  const confirmWinner = await fetch(${SERVER}/confirm, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seatId, userId: winner.user }),
+  }).then((r) => r.json());
+
+  console.log("Confirm by winner:", confirmWinner);
+
+  const loser = users.find((u) => u !== winner.user);
+  const confirmLoser = await fetch(${SERVER}/confirm, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seatId, userId: loser }),
+  }).then((r) => r.json());
+
+  console.log("Confirm by loser:", confirmLoser);
+}
+setTimeout(runSimulation, 1000);
